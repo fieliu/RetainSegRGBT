@@ -1,0 +1,950 @@
+"""Quality-Gated MiT with Mamba Fusion.
+
+Token pruning (DynamicViT-style) on a multi-branch MiT backbone with
+Gumbel-Softmax hard gating, quality-modulated fusion, and three-phase
+training.  Fully self-contained — only depends on BaseSegmentor + v9_utils.
+"""
+
+import math
+import random
+from typing import List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from mmengine.model import BaseModule
+from torch import Tensor
+
+from mmseg.models.segmentors.base import BaseSegmentor
+from mmseg.models.segmentors.v9_utils import (
+    QualityPredictor,
+    f_attn,
+    f_fuse,
+    f_hard_mask,
+    downsample_mask,
+    get_degradation_schedule,
+    sample_level,
+    _apply_degradation,
+    _generate_local_mask,
+    compute_cross_modal_contrastive_loss,
+    compute_quality_anchor_loss,
+    compute_quality_rank_loss,
+)
+from mmseg.registry import MODELS
+from mmseg.structures import SegDataSample
+from mmseg.utils import (ConfigType, OptConfigType, OptMultiConfig,
+                         SampleList, add_prefix)
+
+# ---------------------------------------------------------------------------
+# Helper: MiT NLC ↔ NCHW
+# ---------------------------------------------------------------------------
+
+def nlc_to_nchw(x, hw_shape):
+    H, W = hw_shape
+    B, _, C = x.shape
+    return x.transpose(1, 2).reshape(B, C, H, W)
+
+
+def nchw_to_nlc(x):
+    return x.flatten(2).transpose(1, 2)
+
+# ---------------------------------------------------------------------------
+# Fusion modules
+# ---------------------------------------------------------------------------
+
+class DualGateEnhancedFusion(nn.Module):
+    """Channel + spatial dual-gate fusion of the PURE private residuals.
+
+    Inputs are zp_rgb·f_fuse(s_priv) / zp_t·f_fuse(s_priv) (quality-modulated,
+    so a missing modality's residual is already driven toward 0) and the common
+    fused feature zf. zf is the single base; the gated private residuals are
+    added on top. zf is no longer triple-counted (it previously leaked in via
+    re=zf+priv and te=zf+priv), which over-weighted the common branch.
+    """
+
+    def __init__(self, in_channels_list):
+        super().__init__()
+        self.num_stages = len(in_channels_list)
+        self.ch_gates = nn.ModuleList()
+        self.sp_gates = nn.ModuleList()
+        self.post_norms = nn.ModuleList()
+        self.post_convs = nn.ModuleList()
+        for ch in in_channels_list:
+            self.ch_gates.append(nn.Sequential(
+                nn.Conv2d(ch * 2, ch * 2, 1, bias=False), nn.ReLU(inplace=True),
+                nn.Conv2d(ch * 2, ch * 2, 1, bias=False), nn.Sigmoid()))
+            self.sp_gates.append(nn.Sequential(
+                nn.Conv2d(ch * 2, 2, 3, padding=1, bias=False), nn.Sigmoid()))
+            self.post_norms.append(nn.LayerNorm(ch))
+            self.post_convs.append(nn.Sequential(nn.Conv2d(ch, ch, 1, bias=False), nn.GELU()))
+
+    def forward(self, priv_r_list, priv_t_list, common_fused_list):
+        fused_list = []
+        for i in range(self.num_stages):
+            Pr, Pt, Fg = priv_r_list[i], priv_t_list[i], common_fused_list[i]
+            ref_h, ref_w = Fg.shape[2], Fg.shape[3]
+            if Pr.shape[2:] != (ref_h, ref_w):
+                Pr = F.interpolate(Pr, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
+            if Pt.shape[2:] != (ref_h, ref_w):
+                Pt = F.interpolate(Pt, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
+            B, C, H, W = Pr.shape
+            concat = torch.cat([Pr, Pt], dim=1)
+            ch_gate = self.ch_gates[i](concat)
+            ch_r, ch_t = ch_gate.split(C, dim=1)
+            sp_gate = self.sp_gates[i](concat)
+            sp_r, sp_t = sp_gate[:, 0:1], sp_gate[:, 1:2]
+            gated = ch_r * sp_r * Pr + ch_t * sp_t * Pt
+            gated_norm = gated.permute(0, 2, 3, 1).contiguous()
+            gated_norm = self.post_norms[i](gated_norm).permute(0, 3, 1, 2).contiguous()
+            out = self.post_convs[i](gated_norm)
+            fused_out = Fg + out
+            fused_out = fused_out.permute(0, 2, 3, 1).contiguous()
+            fused_out = F.layer_norm(fused_out, [fused_out.size(-1)])
+            fused_out = fused_out.permute(0, 3, 1, 2).contiguous()
+            fused_list.append(fused_out)
+        return fused_list
+
+
+# ---------------------------------------------------------------------------
+# Quality-aware MiT forward functions
+# ---------------------------------------------------------------------------
+
+def _forward_common_dual_pruned(backbone, input_rgbt, orig_B,
+                                 predictors_rgb, predictors_t,
+                                 training=True,
+                                 force_all_keep=False, phase=3,
+                                 tau=0.3, alpha=10.0, tau_hard=0.2):
+    """Quality-aware forward through a single MiT backbone for both modalities.
+
+    Uses continuous quality score with piecewise modulation instead of hard
+    gating. Per-stage scores are raw (no cross-stage cascade): each predictor
+    is explicitly supervised, so deeper stages judge quality independently.
+    """
+    outs, all_s_rgb, all_s_t = [], [], []
+
+    for i, layer in enumerate(backbone.layers):
+        patch_embed, blocks, norm = layer[0], layer[1], layer[2]
+        x, hw_shape = patch_embed(input_rgbt)
+        H, W = hw_shape
+        B_tok = x.shape[0]
+
+        s_rgb = s_t = None
+        if force_all_keep:
+            s_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+            s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+        elif i < len(predictors_rgb) and predictors_rgb[i] is not None:
+            x_2d = nlc_to_nchw(x, hw_shape)
+            s_rgb = predictors_rgb[i](x_2d[:orig_B],
+                                       torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype))
+            s_t = predictors_t[i](x_2d[orig_B:],
+                                   torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype))
+        if s_rgb is None:
+            s_rgb = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+        if s_t is None:
+            s_t = torch.ones(orig_B, 1, H, W, device=x.device, dtype=x.dtype)
+
+        # Raw per-stage quality scores (no cross-stage cascade): each predictor
+        # is now explicitly supervised, so deeper stages judge independently.
+        all_s_rgb.append(s_rgb)
+        all_s_t.append(s_t)
+
+        s_avg = (s_rgb + s_t) / 2 + 1e-8
+        rel_s_rgb = s_rgb / s_avg
+        rel_s_t = s_t / s_avg
+        rel_s_combined = torch.cat([rel_s_rgb, rel_s_t], dim=0)
+        s_combined = torch.cat([s_rgb, s_t], dim=0)
+        hard_mask = f_hard_mask(s_combined, tau_hard=tau_hard)
+
+        for j, block in enumerate(blocks):
+            residual = x
+            x_norm1 = block.norm1(x)
+            attn_module = block.attn
+            x_q = x_norm1
+            if attn_module.sr_ratio > 1:
+                x_kv = nlc_to_nchw(x_norm1, hw_shape)
+                x_kv = attn_module.sr(x_kv)
+                x_kv = nchw_to_nlc(x_kv)
+                x_kv = attn_module.norm(x_kv)
+            else:
+                x_kv = x_norm1
+
+            Bb, N_tok, C_tok = x_q.shape
+            num_heads, head_dim = attn_module.num_heads, C_tok // attn_module.num_heads
+            hw_shape_k = hw_shape
+
+            w = attn_module.attn.in_proj_weight
+            q_w, k_w, v_w = w[:C_tok], w[C_tok:2*C_tok], w[2*C_tok:]
+            b = attn_module.attn.in_proj_bias
+            q_b = b[:C_tok] if b is not None else None
+            k_b = b[C_tok:2*C_tok] if b is not None else None
+            v_b = b[2*C_tok:] if b is not None else None
+
+            Q = F.linear(x_q, q_w, q_b)
+            K = F.linear(x_norm1, k_w, k_b)
+            V = F.linear(x_kv, v_w, v_b)
+
+            if attn_module.sr_ratio > 1:
+                K = nlc_to_nchw(K, hw_shape)
+                K = attn_module.sr(K)
+                hw_shape_k = K.shape[2:]
+                K = nchw_to_nlc(K)
+                K = attn_module.norm(K)
+
+            Q = Q.reshape(Bb, N_tok, num_heads, head_dim).permute(0, 2, 1, 3)
+            K = K.reshape(Bb, -1, num_heads, head_dim).permute(0, 2, 1, 3)
+            V = V.reshape(Bb, -1, num_heads, head_dim).permute(0, 2, 1, 3)
+
+            scale = head_dim ** -0.5
+            attn = (Q @ K.transpose(-2, -1)) * scale
+
+            H_k, W_k = hw_shape_k
+            s_k = downsample_mask(rel_s_combined, H_k, W_k)
+            attn_bias = f_attn(s_k, tau=tau, alpha=alpha).reshape(Bb, 1, 1, -1)
+            attn = attn + attn_bias.to(attn.dtype)
+
+            attn = attn.float().softmax(dim=-1).to(V.dtype)
+            if hasattr(attn_module, 'dropout_layer') and attn_module.dropout_layer is not None:
+                attn = attn_module.dropout_layer(attn)
+            attn_out = (attn @ V).transpose(1, 2).reshape(Bb, N_tok, C_tok)
+            attn_out = attn_module.proj_drop(attn_module.attn.out_proj(attn_out))
+            x = residual + attn_out
+
+            residual = x
+            x_norm2 = block.norm2(x)
+            ffn_out = nlc_to_nchw(x_norm2, hw_shape)
+            ffn_out = block.ffn.layers(ffn_out)
+            ffn_out = nchw_to_nlc(ffn_out)
+            ffn_out = block.ffn.dropout_layer(ffn_out)
+            x = residual + ffn_out
+
+        x = norm(x)
+        x = x * hard_mask.view(B_tok, H * W, 1)
+        x = nlc_to_nchw(x, hw_shape)
+        if i in backbone.out_indices:
+            outs.append(x)
+        input_rgbt = x
+
+    return outs, all_s_rgb, all_s_t
+
+
+def _forward_branch_pruned(backbone, img, predictor_list,
+                            training=True,
+                            force_all_keep=False, phase=3,
+                            tau=0.3, alpha=10.0, tau_hard=0.2):
+    """Quality-aware forward through a single-branch MiT backbone.
+
+    Uses continuous quality score with piecewise modulation instead of hard
+    gating. Per-stage scores are raw (no cross-stage cascade).
+
+    Returns:
+        outs:      list of feature maps [B, C_i, H_i, W_i]
+        all_s:     list of per-stage quality scores
+    """
+    outs, all_s = [], []
+
+    for i, layer in enumerate(backbone.layers):
+        patch_embed, blocks, norm = layer[0], layer[1], layer[2]
+        x, hw_shape = patch_embed(img)
+        H, W = hw_shape
+        B_tok = x.shape[0]
+
+        s = None
+        if force_all_keep:
+            s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+        elif i < len(predictor_list) and predictor_list[i] is not None:
+            x_2d = nlc_to_nchw(x, hw_shape)
+            s = predictor_list[i](x_2d,
+                                   torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype))
+        if s is None:
+            s = torch.ones(B_tok, 1, H, W, device=x.device, dtype=x.dtype)
+
+        # Raw per-stage score (no cross-stage cascade — explicitly supervised).
+        all_s.append(s)
+        hard_mask = f_hard_mask(s, tau_hard=tau_hard)
+
+        for j, block in enumerate(blocks):
+            residual = x
+            x_norm1 = block.norm1(x)
+            attn_module = block.attn
+            x_q = x_norm1
+            if attn_module.sr_ratio > 1:
+                x_kv = nlc_to_nchw(x_norm1, hw_shape)
+                x_kv = attn_module.sr(x_kv)
+                x_kv = nchw_to_nlc(x_kv)
+                x_kv = attn_module.norm(x_kv)
+            else:
+                x_kv = x_norm1
+
+            Bb, N_tok, C_tok = x_q.shape
+            num_heads, head_dim = attn_module.num_heads, C_tok // attn_module.num_heads
+            hw_shape_k = hw_shape
+
+            w = attn_module.attn.in_proj_weight
+            q_w, k_w, v_w = w[:C_tok], w[C_tok:2*C_tok], w[2*C_tok:]
+            b = attn_module.attn.in_proj_bias
+            q_b = b[:C_tok] if b is not None else None
+            k_b = b[C_tok:2*C_tok] if b is not None else None
+            v_b = b[2*C_tok:] if b is not None else None
+
+            Q = F.linear(x_q, q_w, q_b)
+            K = F.linear(x_norm1, k_w, k_b)
+            V = F.linear(x_kv, v_w, v_b)
+
+            if attn_module.sr_ratio > 1:
+                K = nlc_to_nchw(K, hw_shape)
+                K = attn_module.sr(K)
+                hw_shape_k = K.shape[2:]
+                K = nchw_to_nlc(K)
+                K = attn_module.norm(K)
+
+            Q = Q.reshape(Bb, N_tok, num_heads, head_dim).permute(0, 2, 1, 3)
+            K = K.reshape(Bb, -1, num_heads, head_dim).permute(0, 2, 1, 3)
+            V = V.reshape(Bb, -1, num_heads, head_dim).permute(0, 2, 1, 3)
+
+            scale = head_dim ** -0.5
+            attn = (Q @ K.transpose(-2, -1)) * scale
+
+            H_k, W_k = hw_shape_k
+            s_k = downsample_mask(s, H_k, W_k)
+            attn_bias = f_attn(s_k, tau=tau, alpha=alpha).reshape(Bb, 1, 1, -1)
+            attn = attn + attn_bias.to(attn.dtype)
+
+            attn = attn.float().softmax(dim=-1).to(V.dtype)
+            if hasattr(attn_module, 'dropout_layer') and attn_module.dropout_layer is not None:
+                attn = attn_module.dropout_layer(attn)
+            attn_out = (attn @ V).transpose(1, 2).reshape(Bb, N_tok, C_tok)
+            attn_out = attn_module.proj_drop(attn_module.attn.out_proj(attn_out))
+            x = residual + attn_out
+
+            residual = x
+            x_norm2 = block.norm2(x)
+            ffn_out = nlc_to_nchw(x_norm2, hw_shape)
+            ffn_out = block.ffn.layers(ffn_out)
+            ffn_out = nchw_to_nlc(ffn_out)
+            ffn_out = block.ffn.dropout_layer(ffn_out)
+            x = residual + ffn_out
+
+        x = norm(x)
+        x = x * hard_mask.view(B_tok, H * W, 1)
+        x = nlc_to_nchw(x, hw_shape)
+        if i in backbone.out_indices:
+            outs.append(x)
+        img = x
+
+    return outs, all_s
+
+
+@MODELS.register_module()
+class QualityGatedMiTMamba(BaseSegmentor):
+    """..."""
+
+    def __init__(self,
+                 backbone: ConfigType,
+                 private_branch_rgb: ConfigType,
+                 private_branch_t: ConfigType,
+                 decode_head: ConfigType,
+                 common_decode_head: OptConfigType = None,
+                 rgb_private_decode_head: OptConfigType = None,
+                 t_private_decode_head: OptConfigType = None,
+                 neck: OptConfigType = None,
+                 auxiliary_head: OptConfigType = None,
+                 train_cfg: OptConfigType = None,
+                 test_cfg: OptConfigType = None,
+                 data_preprocessor: OptConfigType = None,
+                 pretrained: Optional[str] = None,
+                 loss_quality_weight: float = 0.5,
+                 loss_rank_weight: float = 0.3,
+                 phase1_epochs: int = 10,
+                 phase2_epochs: int = 20,
+                 total_epochs: int = 200,
+                 phase_mode: str = 'absolute',
+                 loss_align_weight: float = 0.1,
+                 contrast_tau: float = 0.07,
+                 contrast_num_samples: int = 512,
+                 loss_distill_weight: float = 0.3,
+                 distill_temperature: float = 4.0,
+                 aux_loss_weight: float = 0.3,
+                 loss_invariant_weight: float = 0.03,
+                 missing_ratio: float = 0.3,
+                 global_deg_ratio: float = 0.3,
+                 local_deg_ratio: float = 0.4,
+                 mamba_d_state: int = 16, mamba_d_conv: int = 4, mamba_expand: int = 2,
+                 tau: float = 0.3,
+                 alpha: float = 10.0,
+                 tau_hard: float = 0.2,
+                 fuse_epsilon: float = 1e-3,
+                 fuse_beta: float = 6.0,
+                 skip_phases: bool = False,
+                 init_cfg: OptMultiConfig = None):
+        super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+        if pretrained is not None:
+            backbone['pretrained'] = pretrained
+        self.backbone = MODELS.build(backbone)
+        self.private_branch_rgb = MODELS.build(private_branch_rgb)
+        self.private_branch_t = MODELS.build(private_branch_t)
+        if neck is not None:
+            self.neck = MODELS.build(neck)
+        self._init_decode_head(decode_head)
+        self._init_aux_heads(common_decode_head, rgb_private_decode_head,
+                             t_private_decode_head, auxiliary_head)
+        self.train_cfg, self.test_cfg = train_cfg, test_cfg
+
+        num_heads = backbone.get('num_heads', [1, 2, 5, 8])
+        embed_dims_base = backbone.get('embed_dims', 64)
+        self.embed_dims_list = [embed_dims_base * h for h in num_heads]
+        self.tau = tau
+        self.alpha = alpha
+        self.tau_hard = tau_hard
+        self.fuse_epsilon = fuse_epsilon
+        self.fuse_beta = fuse_beta
+        self._build_predictors()
+        self.final_fusion = DualGateEnhancedFusion(self.embed_dims_list)
+
+        self.loss_quality_weight = loss_quality_weight
+        self.loss_rank_weight = loss_rank_weight
+        self.phase1_epochs, self.phase2_epochs = phase1_epochs, phase2_epochs
+        self.total_epochs = total_epochs
+        self.phase_mode = phase_mode
+        self.loss_align_weight = loss_align_weight
+        self.contrast_tau, self.contrast_num_samples = contrast_tau, contrast_num_samples
+        self.loss_distill_weight = loss_distill_weight
+        self.distill_temperature = distill_temperature
+        self.aux_loss_weight = aux_loss_weight
+        self.loss_invariant_weight = loss_invariant_weight
+        self.missing_ratio, self.global_deg_ratio = missing_ratio, global_deg_ratio
+        self.local_deg_ratio = local_deg_ratio
+        self.skip_phases = skip_phases
+
+    def _build_predictors(self):
+        self.predictors_common_rgb = nn.ModuleList(
+            [QualityPredictor(ch) for ch in self.embed_dims_list])
+        self.predictors_common_t = nn.ModuleList(
+            [QualityPredictor(ch) for ch in self.embed_dims_list])
+        self.predictors_priv_rgb = nn.ModuleList(
+            [QualityPredictor(ch) for ch in self.embed_dims_list])
+        self.predictors_priv_t = nn.ModuleList(
+            [QualityPredictor(ch) for ch in self.embed_dims_list])
+
+    # ---- BaseSegmentor overrides ----
+
+    def _init_decode_head(self, decode_head):
+        self.decode_head = MODELS.build(decode_head)
+        self.align_corners = self.decode_head.align_corners
+        self.num_classes = self.decode_head.num_classes
+        self.out_channels = self.decode_head.out_channels
+
+    def _init_aux_heads(self, common_cfg, rgb_cfg, t_cfg, aux_cfg):
+        self.common_decode_head = MODELS.build(common_cfg) if common_cfg else None
+        self.rgb_private_decode_head = MODELS.build(rgb_cfg) if rgb_cfg else None
+        self.t_private_decode_head = MODELS.build(t_cfg) if t_cfg else None
+        if aux_cfg:
+            self.auxiliary_head = MODELS.build(aux_cfg) if not isinstance(aux_cfg, list) \
+                else nn.ModuleList([MODELS.build(h) for h in aux_cfg])
+
+    @staticmethod
+    def _stack_batch_gt(data_samples):
+        return torch.stack([ds.gt_sem_seg.data for ds in data_samples], dim=0)
+
+    @staticmethod
+    def _build_pad_mask(data_samples, h, w, device):
+        valid = torch.zeros(len(data_samples), h, w, dtype=torch.bool, device=device)
+        for i, ds in enumerate(data_samples):
+            ps = ds.metainfo.get('padding_size', [0, 0, 0, 0])
+            pl, pr, pt, pb = ps
+            valid[i, pt:h - pb, pl:w - pr] = True
+        return valid
+
+    def _get_training_phase(self, epoch):
+        if self.skip_phases:
+            return 3
+        if self.phase_mode == 'ratio':
+            r = min(epoch / max(self.total_epochs, 1), 1.0)
+            if r < 0.1: return 1
+            elif r < 0.3: return 2
+            return 3
+        # absolute (default)
+        if epoch < self.phase1_epochs: return 1
+        elif epoch < self.phase1_epochs + self.phase2_epochs: return 2
+        return 3
+
+    def _update_training_phase(self, epoch):
+        phase = self._get_training_phase(epoch)
+        all_p = [self.predictors_common_rgb, self.predictors_common_t,
+                 self.predictors_priv_rgb, self.predictors_priv_t]
+        if phase == 1 or phase == 2:
+            for pl in all_p:
+                for m in pl:
+                    for p in m.parameters(): p.requires_grad = False
+        else:
+            for pl in all_p:
+                for m in pl:
+                    for p in m.parameters(): p.requires_grad = True
+        return phase
+
+    def _quality_anchor_all(self, s_lists, lm_list, pm_full):
+        """Hinge anchors over quality maps. s_lists/lm_list are parallel: each
+        score list is supervised by its modality level map (clean=1, deg=2..5).
+        RGB maps (s_r, spr) use the RGB level map; T maps (s_t, spt) the T map."""
+        total, cnt = 0., 0
+        for s_list, lm in zip(s_lists, lm_list):
+            if lm is None: continue
+            for s in s_list:
+                if s is None: continue
+                total = total + compute_quality_anchor_loss(s, lm, pad_mask=pm_full)
+                cnt += 1
+        return (total / cnt) if cnt else None
+
+    def _quality_rank_all(self, sc_lists, sd_lists, lmc_list, lmd_list, pm_full):
+        """Level-staircase ranking: same token, clean vs degraded forward.
+        Enforces s_clean - s_deg >= 0.2*(L_deg - L_clean) where deg is higher."""
+        total, cnt = 0., 0
+        for sc, sd, lmc, lmd in zip(sc_lists, sd_lists, lmc_list, lmd_list):
+            if lmc is None or lmd is None: continue
+            for a, b in zip(sc, sd):
+                if a is None or b is None: continue
+                total = total + compute_quality_rank_loss(a, b, lmc, lmd, pad_mask=pm_full)
+                cnt += 1
+        return (total / cnt) if cnt else None
+
+    def _quality_weighted_common_fusion(self, zc_rgb, zc_t, s_rgb, s_t):
+        if s_rgb.shape[2:] != zc_rgb.shape[2:]:
+            s_rgb = F.interpolate(s_rgb, size=zc_rgb.shape[2:], mode='nearest')
+        if s_t.shape[2:] != zc_t.shape[2:]:
+            s_t = F.interpolate(s_t, size=zc_t.shape[2:], mode='nearest')
+        w_rgb = f_fuse(s_rgb, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+        w_t = f_fuse(s_t, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+        w_sum = w_rgb + w_t + 1e-8
+        return (w_rgb / w_sum) * zc_rgb + (w_t / w_sum) * zc_t
+
+    def init_weights(self):
+        self.backbone.init_weights()
+        self.private_branch_rgb.init_weights()
+        self.private_branch_t.init_weights()
+        if self.init_cfg: super().init_weights()
+
+    def _extract_feat_single(self, rgb, t):
+        B = rgb.shape[0]
+        epoch = getattr(self, 'current_epoch', 0)
+        ph = self._get_training_phase(epoch)
+        fa = (ph < 3)
+
+        zc_outs, s_r, s_t = _forward_common_dual_pruned(
+            self.backbone, torch.cat([rgb, t], dim=0), orig_B=B,
+            predictors_rgb=self.predictors_common_rgb,
+            predictors_t=self.predictors_common_t,
+            training=self.training, force_all_keep=fa, phase=ph,
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
+        zc_r = [f[:B] for f in zc_outs]; zc_t = [f[B:] for f in zc_outs]
+
+        zp_r, spr = _forward_branch_pruned(
+            self.private_branch_rgb, rgb, self.predictors_priv_rgb,
+            training=self.training, force_all_keep=fa, phase=ph,
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
+
+        zp_t, spt = _forward_branch_pruned(
+            self.private_branch_t, t, self.predictors_priv_t,
+            training=self.training, force_all_keep=fa, phase=ph,
+            tau=self.tau, alpha=self.alpha, tau_hard=self.tau_hard)
+
+        zf, re, te = [], [], []
+        for i in range(len(self.embed_dims_list)):
+            sri = s_r[i] if s_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
+            sti = s_t[i] if s_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
+            fused = self._quality_weighted_common_fusion(zc_r[i], zc_t[i], sri, sti)
+            zf_i = fused.permute(0,2,3,1).contiguous()
+            zf_i = F.layer_norm(zf_i, [zf_i.size(-1)])
+            zf_i = zf_i.permute(0,3,1,2).contiguous()
+            zf.append(zf_i)
+
+            if zf[i].shape[2:]==zp_r[i].shape[2:]:
+                spr_i = spr[i] if spr[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device)
+                w_priv = f_fuse(spr_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+                priv_mod = zp_r[i] * w_priv
+                out = zf[i] + priv_mod
+                out = out.permute(0,2,3,1).contiguous()
+                out = F.layer_norm(out, [out.size(-1)])
+                out = out.permute(0,3,1,2).contiguous()
+                re.append(out)
+            else: re.append(zp_r[i])
+
+            if zf[i].shape[2:]==zp_t[i].shape[2:]:
+                spt_i = spt[i] if spt[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device)
+                w_priv = f_fuse(spt_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta)
+                priv_mod = zp_t[i] * w_priv
+                out = zf[i] + priv_mod
+                out = out.permute(0,2,3,1).contiguous()
+                out = F.layer_norm(out, [out.size(-1)])
+                out = out.permute(0,3,1,2).contiguous()
+                te.append(out)
+            else: te.append(zp_t[i])
+
+        # A-scheme final fusion: gate the PURE private residuals (zp · f_fuse(s_priv)),
+        # with zf as the single base. re/te (= zf + private) still feed the private
+        # decode heads, but no longer triple-count zf inside the final fusion.
+        priv_r_list, priv_t_list = [], []
+        for i in range(len(self.embed_dims_list)):
+            spr_i = spr[i] if spr[i] is not None else torch.ones(B,1,zp_r[i].shape[2],zp_r[i].shape[3],device=zp_r[i].device)
+            spt_i = spt[i] if spt[i] is not None else torch.ones(B,1,zp_t[i].shape[2],zp_t[i].shape[3],device=zp_t[i].device)
+            priv_r_list.append(zp_r[i] * f_fuse(spr_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta))
+            priv_t_list.append(zp_t[i] * f_fuse(spt_i, tau=self.tau, epsilon=self.fuse_epsilon, beta=self.fuse_beta))
+        ff = self.final_fusion(priv_r_list, priv_t_list, zf)
+        all_s = [s for sl in [s_r, s_t, spr, spt] for s in sl]
+        return zc_r, zc_t, zp_r, zp_t, zf, re, te, ff, s_r, s_t, all_s, spr, spt
+
+    def _train_with_degradation(self, rgb, ir):
+        dr, di, _, _ = self._generate_degraded_inputs(rgb, ir)
+        return self._extract_feat_single(dr, di)
+
+    def _generate_degraded_inputs(self, rgb, ir):
+        B, C, H, W = rgb.shape
+        dev = rgb.device
+        rm = self.data_preprocessor.mean[:3].to(dev); rs = self.data_preprocessor.std[:3].to(dev)
+        im = self.data_preprocessor.mean[3:].to(dev); iss = self.data_preprocessor.std[3:].to(dev)
+        dr, di = rgb.clone(), ir.clone()
+        dtr, dtt = ['none']*B, ['none']*B
+        # Per-pixel degradation-level maps (clean=1, deg=2..5; missing=5). Stashed
+        # on self for the quality/rank losses to read after this forward.
+        lvl_r = torch.ones(B, 1, H, W, device=dev)
+        lvl_t = torch.ones(B, 1, H, W, device=dev)
+        ep = getattr(self,'current_epoch',0)
+        sched = get_degradation_schedule(min(ep/max(self.total_epochs,1),1.0))
+        for b in range(B):
+            r = random.random()
+            if r < sched['p_missing']:
+                if random.random() < 0.5:
+                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,deg_type='missing',level=5)
+                    dtr[b]='missing'; lvl_r[b] = 5.0
+                else:
+                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,deg_type='missing',level=5)
+                    dtt[b]='missing'; lvl_t[b] = 5.0
+            elif r < sched['p_missing']+sched['p_global']:
+                lv = sample_level(sched['global_levels'])
+                if random.random() < 0.5:
+                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv); dtr[b]='global'; lvl_r[b] = float(lv)
+                else:
+                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv); dtt[b]='global'; lvl_t[b] = float(lv)
+            else:
+                lv = sample_level(sched['local_levels'])
+                lm = _generate_local_mask(1,H,W,num_regions=3,device=dev,level=lv)
+                if random.random() < 0.5:
+                    dr[b:b+1] = _apply_degradation(rgb[b:b+1],'rgb',rm,rs,level=lv,is_local=True,local_mask=lm)
+                    dtr[b]='local'; lvl_r[b] = 1.0 + (float(lv) - 1.0) * lm[0]
+                else:
+                    di[b:b+1] = _apply_degradation(ir[b:b+1],'thermal',im,iss,level=lv,is_local=True,local_mask=lm)
+                    dtt[b]='local'; lvl_t[b] = 1.0 + (float(lv) - 1.0) * lm[0]
+        self._last_level_rgb, self._last_level_t = lvl_r, lvl_t
+        return dr, di, dtr, dtt
+
+    # ---- loss / predict / inference ----
+
+    def loss(self, inputs, data_samples):
+        rgb, ir = inputs[:,:3], inputs[:,3:]
+        B = rgb.shape[0]
+        ep = getattr(self,'current_epoch',0)
+        ph = self._get_training_phase(ep)
+        self._update_training_phase(ep)
+        (zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,s_r,s_t,all_s,spr,spt) = self._extract_feat_single(rgb,ir)
+        losses = {}
+        sl = self._stack_batch_gt(data_samples)
+        for ds in data_samples:
+            if hasattr(ds,'gt_sem_seg'): ds.gt_sem_seg.data = ds.gt_sem_seg.data.squeeze(0)
+        losses.update(add_prefix(self.decode_head.loss(ff,data_samples,self.train_cfg),'decode'))
+        if self.common_decode_head and zf: losses.update(add_prefix(self.common_decode_head.loss(zf,data_samples,self.train_cfg),'common_decode'))
+        if self.rgb_private_decode_head and re: losses.update(add_prefix(self.rgb_private_decode_head.loss(re,data_samples,self.train_cfg),'rgb_private_decode'))
+        if self.t_private_decode_head and te: losses.update(add_prefix(self.t_private_decode_head.loss(te,data_samples,self.train_cfg),'t_private_decode'))
+        if self.loss_align_weight > 0:
+            gt = sl.squeeze(1).long(); lc, cnt = 0., 0
+            pm = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device)
+            for i in range(len(zc_r)):
+                if zc_r[i] is not None and zc_t[i] is not None:
+                    Dr = (s_r[i] > self.tau).float().detach() if s_r[i] is not None else torch.ones(B,1,zc_r[i].shape[2],zc_r[i].shape[3],device=zc_r[i].device)
+                    Dt = (s_t[i] > self.tau).float().detach() if s_t[i] is not None else torch.ones(B,1,zc_t[i].shape[2],zc_t[i].shape[3],device=zc_t[i].device)
+                    sr_i = s_r[i].detach() if s_r[i] is not None else None
+                    st_i = s_t[i].detach() if s_t[i] is not None else None
+                    lc += compute_cross_modal_contrastive_loss(
+                        zc_r[i],zc_t[i],gt,Dr,Dt,sr_i,st_i,
+                        tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
+                        ignore_label=255, pad_mask=pm)
+                    cnt += 1
+            if cnt: losses['loss_align'] = (lc/cnt)*self.loss_align_weight
+        # Quality anchor on the CLEAN forward: every token is clean (level=1),
+        # so push all 16 quality maps up toward >0.8. RGB maps (s_r, spr) and
+        # T maps (s_t, spt) share an all-ones level map here.
+        if self.loss_quality_weight > 0:
+            pm_q = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device).float().unsqueeze(1)
+            ones_lm = torch.ones(B, 1, inputs.shape[-2], inputs.shape[-1], device=inputs.device)
+            q_clean = self._quality_anchor_all([s_r, spr, s_t, spt],
+                                               [ones_lm, ones_lm, ones_lm, ones_lm], pm_q)
+            if q_clean is not None:
+                losses['loss_quality'] = self.loss_quality_weight * q_clean
+        if self.training:
+            (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = self._train_with_degradation(rgb,ir)
+            if torch.isnan(df[0]).any():
+                import logging
+                logging.getLogger(__name__).warning(
+                    'NaN in degraded features — falling back to clean features for deg losses')
+                (dzcr,dzct,dzpr,dzpt,dzf,drl,dtl,df,ds_r,ds_t,dall_s,dspr,dspt) = \
+                    zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,s_r,s_t,all_s,spr,spt
+            losses.update(add_prefix(self.decode_head.loss(df,data_samples,self.train_cfg),'deg_decode'))
+            # Degraded forward: anchor level-5 tokens down (<0.2), clean tokens up
+            # (>0.8); and rank clean-vs-degraded so each extra level drops quality
+            # by >=0.2. lvl_r/lvl_t are the per-pixel level maps for this deg pass.
+            lvl_r = getattr(self, '_last_level_rgb', None)
+            lvl_t = getattr(self, '_last_level_t', None)
+            if self.loss_quality_weight > 0 and ph >= 3 and lvl_r is not None and lvl_t is not None:
+                pm_q = self._build_pad_mask(data_samples, inputs.shape[-2], inputs.shape[-1], inputs.device).float().unsqueeze(1)
+                q_deg = self._quality_anchor_all([ds_r, dspr, ds_t, dspt],
+                                                 [lvl_r, lvl_r, lvl_t, lvl_t], pm_q)
+                if q_deg is not None:
+                    losses['loss_quality_deg'] = self.loss_quality_weight * q_deg
+                if self.loss_rank_weight > 0:
+                    ones_lm = torch.ones_like(lvl_r)
+                    q_rank = self._quality_rank_all(
+                        [s_r, spr, s_t, spt], [ds_r, dspr, ds_t, dspt],
+                        [ones_lm, ones_lm, ones_lm, ones_lm],
+                        [lvl_r, lvl_r, lvl_t, lvl_t], pm_q)
+                    if q_rank is not None:
+                        losses['loss_rank'] = self.loss_rank_weight * q_rank
+            for head, feats, pfx in [
+                (self.common_decode_head, dzf, 'deg_common_decode'),
+                (self.rgb_private_decode_head, drl, 'deg_rgb_private_decode'),
+                (self.t_private_decode_head, dtl, 'deg_t_private_decode'),
+            ]:
+                if head and feats:
+                    ld = {k: v*self.aux_loss_weight for k,v in head.loss(feats,data_samples,self.train_cfg).items()}
+                    losses.update(add_prefix(ld, pfx))
+            if self.loss_align_weight > 0 and dzcr is not None and dzct is not None:
+                dlc, dcnt = 0., 0
+                for i in range(len(dzcr)):
+                    if dzcr[i] is not None and dzct[i] is not None:
+                        dDr_i = (ds_r[i] > self.tau).float().detach() if ds_r is not None and i < len(ds_r) and ds_r[i] is not None else torch.ones(B,1,dzcr[i].shape[2],dzcr[i].shape[3],device=dzcr[i].device)
+                        dDt_i = (ds_t[i] > self.tau).float().detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else torch.ones(B,1,dzct[i].shape[2],dzct[i].shape[3],device=dzct[i].device)
+                        dsr_i = ds_r[i].detach() if ds_r is not None and i < len(ds_r) and ds_r[i] is not None else None
+                        dst_i = ds_t[i].detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else None
+                        dlc += compute_cross_modal_contrastive_loss(
+                            dzcr[i],dzct[i],gt,dDr_i,dDt_i,dsr_i,dst_i,
+                            tau_c=self.contrast_tau,num_samples=self.contrast_num_samples,
+                            ignore_label=255, pad_mask=pm)
+                        dcnt += 1
+                if dcnt: losses['loss_align_deg'] = (dlc/dcnt)*self.loss_align_weight
+            if self.loss_distill_weight > 0 and ph >= 3:
+                T = self.distill_temperature
+                cl = self.decode_head.forward(ff).float(); dl_ = self.decode_head.forward(df).float()
+                tp = F.softmax(cl.detach()/T,dim=1); sp = F.log_softmax(dl_/T,dim=1)
+                kl = F.kl_div(sp,tp,reduction='none').sum(dim=1)
+                dm = self._build_pad_mask(data_samples, kl.shape[-2], kl.shape[-1], kl.device)
+                dm_f = dm.float()
+                losses['loss_distill'] = self.loss_distill_weight*(T*T)*(kl*dm_f).sum()/dm_f.sum().clamp(min=1)
+
+            if self.loss_invariant_weight > 0 and ph >= 3:
+                inv_loss = torch.tensor(0.0, device=ff[0].device)
+                cnt = 0
+                for i in range(len(zf)):
+                    if zf[i] is not None and dzf is not None and i < len(dzf) and dzf[i] is not None:
+                        if zf[i].shape == dzf[i].shape:
+                            Dc = torch.max(
+                                (s_r[i] > self.tau).float().detach() if s_r[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
+                                (s_t[i] > self.tau).float().detach() if s_t[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
+                            Dd = torch.max(
+                                (ds_r[i] > self.tau).float().detach() if ds_r is not None and i < len(ds_r) and ds_r[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device),
+                                (ds_t[i] > self.tau).float().detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else torch.ones(B,1,zf[i].shape[2],zf[i].shape[3],device=zf[i].device))
+                            D_gate = Dc * Dd
+                            qc = torch.max(
+                                s_r[i].detach() if s_r[i] is not None else torch.ones_like(D_gate),
+                                s_t[i].detach() if s_t[i] is not None else torch.ones_like(D_gate))
+                            qd = torch.max(
+                                ds_r[i].detach() if ds_r is not None and i < len(ds_r) and ds_r[i] is not None else torch.ones_like(D_gate),
+                                ds_t[i].detach() if ds_t is not None and i < len(ds_t) and ds_t[i] is not None else torch.ones_like(D_gate))
+                            D_gate = F.interpolate(D_gate, size=zf[i].shape[2:], mode='nearest') if D_gate.shape[2:] != zf[i].shape[2:] else D_gate
+                            qc = F.interpolate(qc, size=zf[i].shape[2:], mode='nearest') if qc.shape[2:] != zf[i].shape[2:] else qc
+                            qd = F.interpolate(qd, size=zf[i].shape[2:], mode='nearest') if qd.shape[2:] != zf[i].shape[2:] else qd
+                            pm_i = self._build_pad_mask(data_samples, zf[i].shape[2], zf[i].shape[3], zf[i].device).float().unsqueeze(1)
+                            q_distill = qc * qd * D_gate * pm_i
+                            diff = F.smooth_l1_loss(zf[i], dzf[i], reduction='none')
+                            denom = q_distill.sum() + 1e-6
+                            inv_loss += (q_distill * diff).sum() / denom
+                            cnt += 1
+                if cnt:
+                    losses['loss_inv'] = self.loss_invariant_weight * inv_loss / cnt
+
+            pass
+        return losses
+
+    def encode_decode(self, inputs, bm):
+        rgb, ir = inputs[:,:3], inputs[:,3:]
+        ff = self._extract_feat_single(rgb,ir)[7]
+        if self.with_neck: ff = self.neck(ff)
+        return self.decode_head.predict(ff, bm, self.test_cfg)
+
+    def encode_decode_with_missing(self, inputs, bm, mask_rgb=False, mask_t=False):
+        """Encode-decode with one modality forced to missing.
+
+        Missing modality is set to -mean/std (black in [0,1] space then
+        re-normalized), matching the training-time _apply_degradation
+        with deg_type='missing', level=5.
+
+        Args:
+            inputs: [B, 6, H, W] concatenated RGB+T input (normalized).
+            bm: batch metas.
+            mask_rgb: if True, replace RGB with missing value.
+            mask_t: if True, replace T with missing value.
+        """
+        rgb, t = inputs[:, :3], inputs[:, 3:]
+        dev = inputs.device
+        if mask_rgb:
+            mean = self.data_preprocessor.mean[:3].view(1, 3, 1, 1).to(dev)
+            std = self.data_preprocessor.std[:3].view(1, 3, 1, 1).to(dev)
+            rgb = torch.full_like(rgb, 0) - mean / std
+        if mask_t:
+            mean = self.data_preprocessor.mean[3:].view(1, 3, 1, 1).to(dev)
+            std = self.data_preprocessor.std[3:].view(1, 3, 1, 1).to(dev)
+            t = torch.full_like(t, 0) - mean / std
+        ff = self._extract_feat_single(rgb, t)[7]
+        if self.with_neck:
+            ff = self.neck(ff)
+        return self.decode_head.predict(ff, bm, self.test_cfg)
+
+    def extract_feat(self, inputs):
+        rgb, t = inputs[:,:3], inputs[:,3:]
+        ff = self._extract_feat_single(rgb,t)[7]
+        return self.neck(ff) if self.with_neck else ff
+
+    def extract_feat_vis(self, inputs):
+        if inputs.shape[1] == 6:
+            rgb, t = inputs[:, :3], inputs[:, 3:]
+        else:
+            B = inputs.shape[0] // 2
+            rgb, t = inputs[:B], inputs[B:]
+        with torch.no_grad():
+            (zc_r,zc_t,zp_r,zp_t,zf,re,te,ff,s_r,s_t,all_s,spr,spt) = self._extract_feat_single(rgb,t)
+            fused = self.neck(ff) if self.with_neck else ff
+
+            deg_rgb, deg_t, deg_type_rgb, deg_type_t = self._generate_degraded_vis_inputs(rgb, t)
+            (zc_r_d,zc_t_d,zp_r_d,zp_t_d,zf_d,re_d,te_d,ff_d,
+             ds_r_d,ds_t_d,dall_s_d,dspr_d,dspt_d) = self._extract_feat_single(deg_rgb, deg_t)
+            fused_d = self.neck(ff_d) if self.with_neck else ff_d
+
+        for i in range(len(zf)):
+            if zc_r_d[i].shape[-2:] != zc_r[i].shape[-2:]:
+                zc_r_d[i] = F.interpolate(zc_r_d[i], size=zc_r[i].shape[-2:], mode='bilinear')
+                zc_t_d[i] = F.interpolate(zc_t_d[i], size=zc_t[i].shape[-2:], mode='bilinear')
+                zf_d[i] = F.interpolate(zf_d[i], size=zf[i].shape[-2:], mode='bilinear')
+                zp_r_d[i] = F.interpolate(zp_r_d[i], size=zp_r[i].shape[-2:], mode='bilinear')
+                zp_t_d[i] = F.interpolate(zp_t_d[i], size=zp_t[i].shape[-2:], mode='bilinear')
+                re_d[i] = F.interpolate(re_d[i], size=re[i].shape[-2:], mode='bilinear')
+                te_d[i] = F.interpolate(te_d[i], size=te[i].shape[-2:], mode='bilinear')
+                ff_d[i] = F.interpolate(ff_d[i], size=ff[i].shape[-2:], mode='bilinear')
+
+        return dict(
+            zc_rgb=zc_r, zc_t=zc_t,
+            zc_fused=zf,
+            zp_rgb=zp_r, zp_t=zp_t,
+            rgb_pf=re, t_pf=te,
+            final_fused=fused,
+            s_rgb=s_r, s_t=s_t,
+            s_rgb_priv=spr, s_t_priv=spt,
+            q_rgb_maps=s_r, q_t_maps=s_t,
+            q_rgb_priv=spr, q_t_priv=spt,
+            clean_rgb_img=rgb, clean_t_img=t,
+            deg_rgb_img=deg_rgb, deg_t_img=deg_t,
+            deg_type_rgb=deg_type_rgb[0] if isinstance(deg_type_rgb, list) else deg_type_rgb,
+            deg_type_t=deg_type_t[0] if isinstance(deg_type_t, list) else deg_type_t,
+            zc_rgb_deg=zc_r_d, zc_t_deg=zc_t_d,
+            zc_fused_deg=zf_d,
+            zp_rgb_deg=zp_r_d, zp_t_deg=zp_t_d,
+            rgb_pf_deg=re_d, t_pf_deg=te_d,
+            final_fused_deg=fused_d,
+            s_rgb_deg=ds_r_d, s_t_deg=ds_t_d,
+            s_rgb_priv_deg=dspr_d, s_t_priv_deg=dspt_d,
+            q_rgb_deg=ds_r_d, q_t_deg=ds_t_d,
+            q_rgb_priv_deg=dspr_d, q_t_priv_deg=dspt_d,
+        )
+
+    def _decode_head_predict_logits(self, feats, head=None):
+        if head is None:
+            head = self.decode_head
+        if hasattr(head, 'pixel_decoder'):
+            batch_img_metas = [
+                dict(ori_shape=feats[0].shape[2:],
+                     img_shape=feats[0].shape[2:])
+            ] * feats[0].shape[0]
+            seg_logits = head.predict(feats, batch_img_metas, self.test_cfg)
+        else:
+            seg_logits = head(feats)
+        return seg_logits
+
+    def _generate_degraded_vis_inputs(self, rgb, ir):
+        """Visualization degradation — follows the same schedule as training."""
+        return self._generate_degraded_inputs(rgb, ir)
+
+    def _forward(self, inputs, data_samples=None):
+        rgb, t = inputs[:,:3], inputs[:,3:]
+        ff = self._extract_feat_single(rgb,t)[7]
+        return self.decode_head.forward(self.neck(ff) if self.with_neck else ff)
+
+    def predict(self, inputs, data_samples=None):
+        if data_samples:
+            bm = [ds.metainfo for ds in data_samples]
+        else:
+            bm = [dict(ori_shape=inputs.shape[2:],img_shape=inputs.shape[2:],pad_shape=inputs.shape[2:],padding_size=[0,0,0,0])]*inputs.shape[0]
+        sl = self.encode_decode(inputs, bm)
+        return self.postprocess_result(sl, data_samples)
+
+    def predict_with_missing(self, inputs, data_samples, mask_rgb=False, mask_t=False):
+        """Predict with one modality forced to missing (all-zero).
+
+        Same as predict() but replaces the specified modality with zeros
+        before feature extraction. Returns postprocessed data_samples.
+        """
+        bm = [ds.metainfo for ds in data_samples]
+        sl = self.encode_decode_with_missing(
+            inputs, bm, mask_rgb=mask_rgb, mask_t=mask_t)
+        return self.postprocess_result(sl, data_samples)
+
+    def postprocess_result(self, seg_logits, data_samples):
+        from mmengine.structures import PixelData
+        B, C, H, W = seg_logits.shape
+        if data_samples is None:
+            data_samples = [SegDataSample() for _ in range(B)]
+        for i in range(B):
+            img_meta = data_samples[i].metainfo
+            ps = img_meta.get('padding_size', [0]*4)
+            pl, pr, pt, pb = ps
+            i_sl = seg_logits[i:i+1,:,pt:H-pb,pl:W-pr]
+            flip = img_meta.get('flip', None)
+            if flip:
+                fd = img_meta.get('flip_direction',None)
+                i_sl = i_sl.flip(dims=(3,) if fd=='horizontal' else (2,))
+            from mmseg.models.utils import resize
+            i_sl = resize(i_sl, size=img_meta['ori_shape'], mode='bilinear',
+                         align_corners=self.align_corners, warning=False).squeeze(0)
+            pred = i_sl.argmax(dim=0, keepdim=True) if C > 1 else (i_sl.sigmoid() > self.decode_head.threshold).to(i_sl)
+            data_samples[i].set_data({'seg_logits': PixelData(data=i_sl), 'pred_sem_seg': PixelData(data=pred)})
+        return data_samples
+
+    def inference(self, inputs, bm):
+        assert self.test_cfg.mode in ['slide','whole']
+        if self.test_cfg.mode == 'slide': return self.slide_inference(inputs, bm)
+        return self.whole_inference(inputs, bm)
+
+    def whole_inference(self, inputs, bm):
+        return self.encode_decode(inputs, bm)
+
+    def slide_inference(self, inputs, bm):
+        hs, ws = self.test_cfg.stride
+        hc, wc = self.test_cfg.crop_size
+        B, _, h_img, w_img = inputs.size()
+        oc = self.out_channels
+        hg = max(h_img-hc+hs-1,0)//hs+1; wg = max(w_img-wc+ws-1,0)//ws+1
+        preds = inputs.new_zeros((B,oc,h_img,w_img))
+        cnt = inputs.new_zeros((B,1,h_img,w_img))
+        for hi in range(hg):
+            for wi in range(wg):
+                y1=hi*hs; x1=wi*ws; y2=min(y1+hc,h_img); x2=min(x1+wc,w_img)
+                y1=max(y2-hc,0); x1=max(x2-wc,0)
+                crop = inputs[:,:,y1:y2,x1:x2]
+                bm[0]['img_shape']=crop.shape[2:]
+                csl = self.encode_decode(crop,bm)
+                preds += F.pad(csl,(int(x1),int(preds.shape[3]-x2),int(y1),int(preds.shape[2]-y2)))
+                cnt[:,:,y1:y2,x1:x2] += 1
+        return preds / cnt

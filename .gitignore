@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# model weights / data / run outputs
+weights/*.pth
+weights/*.ckpt
+*.pth
+*.ckpt
+data/
+work_dirs/
+results/
+pretrain/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
